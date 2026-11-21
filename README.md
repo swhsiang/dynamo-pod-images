@@ -1,7 +1,7 @@
 # dynamo-pod-images
 
 Thin "SSH-ready" images built on top of NVIDIA's Dynamo nightly runtime images, for use as
-RunPod pod templates. They are pushed to GHCR as **private** packages:
+RunPod pod templates. The repo is public; the images are pushed to GHCR as **private** packages:
 
 | framework | base (nvcr.io) | image (ghcr.io) |
 |---|---|---|
@@ -98,14 +98,15 @@ aren't used.
   per kept tag, and RunPod pulls count as transfer out. For example, 3 pulls a week of a 15 GB
   image is about 195 GB/month, or about $98. Delete old versions in the package settings to keep
   storage down.
-- **Actions minutes:** in a private repo, hosted-runner minutes count against the account's
-  monthly allowance. One full run is 3 jobs; expect about 1-2 hours each, dominated by pull and
-  push of the large images.
+- **Actions minutes:** this repo is public, so standard hosted runners are free and unmetered.
+  One full run is 3 jobs; expect about 1-2 hours each, dominated by pull and push of the large
+  images.
 - **Pull from nvcr.io** is free and anonymous.
 
 ## Licence
 
-The bases are NVIDIA NGC containers. NGC's container licence may not permit public
+This repository is public; it holds only the Dockerfile, workflow and docs, no NVIDIA content.
+The images are a different matter. The bases are NVIDIA NGC containers. NGC's container licence may not permit public
 redistribution of derived images, so **these packages must stay private**. Don't change
 their visibility. Pulling them (for example from RunPod) needs registry credentials: a
 GitHub token with only the `read:packages` scope.
