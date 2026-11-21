@@ -1,0 +1,359 @@
+name: build
+
+# Manual only. A proposed (disabled) schedule is in README.md.
+on:
+  workflow_dispatch:
+    inputs:
+      nightly_tag:
+        description: "Dated nightly tag (YYYYMMDD-<shortsha>). Empty = newest dated tag present for every selected framework."
+        required: false
+        default: ""
+        type: string
+      frameworks:
+        description: "Comma-separated subset of: vllm,sglang,tensorrtllm"
+        required: false
+        default: "vllm,sglang,tensorrtllm"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-images
+  cancel-in-progress: false
+
+env:
+  NVCR_NS: nvidia/ai-dynamo
+  GHCR_PREFIX: ghcr.io/swhsiang/dynamo-
+
+jobs:
+  resolve:
+    name: resolve tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      matrix: ${{ steps.fw.outputs.matrix }}
+    steps:
+      - name: Parse frameworks
+        id: fw
+        env:
+          FRAMEWORKS: ${{ inputs.frameworks }}
+        run: |
+          set -euo pipefail
+          json=$(jq -cn --arg s "$FRAMEWORKS" \
+            '$s | split(",") | map(gsub("\\s"; "")) | map(select(length > 0)) | unique')
+          bad=$(jq -r '.[] | select(IN("vllm","sglang","tensorrtllm") | not)' <<<"$json")
+          if [ -n "$bad" ]; then echo "::error::Unknown framework(s): $bad"; exit 1; fi
+          if [ "$(jq length <<<"$json")" -eq 0 ]; then echo "::error::No frameworks selected"; exit 1; fi
+          echo "frameworks: $json"
+          echo "matrix=$json" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve nightly tag
+        id: tag
+        env:
+          WANT: ${{ inputs.nightly_tag }}
+          FWS: ${{ steps.fw.outputs.matrix }}
+        run: |
+          set -euo pipefail
+          # Anonymous pull token + paginated tag list (the registry returns a
+          # relative `Link: <...>; rel="next"` header).
+          list_tags() {
+            local repo="$NVCR_NS/$1-runtime-nightly" token url hdr next
+            token=$(curl -fsS "https://nvcr.io/proxy_auth?scope=repository:${repo}:pull" | jq -r .token)
+            url="https://nvcr.io/v2/${repo}/tags/list?n=1000"
+            hdr=$(mktemp)
+            while [ -n "$url" ]; do
+              curl -fsS -D "$hdr" -H "Authorization: Bearer $token" "$url" | jq -r '.tags[]?'
+              next=$(grep -i '^link:' "$hdr" | sed -E 's/^[^<]*<([^>]+)>.*/\1/' | tr -d '\r' || true)
+              case "$next" in
+                "") url="" ;;
+                http*) url="$next" ;;
+                *) url="https://nvcr.io$next" ;;
+              esac
+            done
+            rm -f "$hdr"
+          }
+          common=""
+          for fw in $(jq -r '.[]' <<<"$FWS"); do
+            list_tags "$fw" | grep -E '^[0-9]{8}-[0-9a-f]{7,40}$' | sort -u > "dated-$fw.txt"
+            echo "$fw: $(wc -l < "dated-$fw.txt") dated tags, newest $(tail -1 "dated-$fw.txt")"
+            if [ -z "$common" ]; then cp "dated-$fw.txt" common.txt; common=1
+            else comm -12 common.txt "dated-$fw.txt" > c.tmp && mv c.tmp common.txt; fi
+          done
+          if [ -n "$WANT" ]; then
+            if ! grep -qxF "$WANT" common.txt; then
+              echo "::error::Tag '$WANT' is not a dated tag present for all of: $FWS"; exit 1
+            fi
+            tag="$WANT"
+          else
+            # YYYYMMDD prefix makes lexical order = date order. Two tags on the
+            # same day would tie-break on the sha (arbitrary); pass nightly_tag
+            # explicitly if that matters.
+            tag=$(tail -1 common.txt)
+            if [ -z "$tag" ]; then echo "::error::No dated tag is common to all of: $FWS"; exit 1; fi
+          fi
+          echo "Resolved nightly tag: $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "### Nightly tag: \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: build ${{ matrix.fw }}
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        fw: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+    env:
+      FW: ${{ matrix.fw }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          echo "================ df -h (BEFORE freeing space) ================"
+          df -h
+          echo "=============================================================="
+
+          # Swap file (on hosted runners it usually lives on /mnt).
+          swaps=$(swapon --show=NAME --noheadings 2>/dev/null || true)
+          sudo swapoff -a || true
+          for f in $swaps; do [ -f "$f" ] && sudo rm -f "$f" && echo "removed swap file $f"; done
+
+          # Preloaded Docker images / build cache.
+          docker image prune -af >/dev/null
+          docker builder prune -af >/dev/null
+
+          # Toolchains this job never uses. Nothing here uses /opt/hostedtoolcache
+          # (no setup-* actions; checkout runs on the runner's bundled node), so
+          # all of it goes, CodeQL included.
+          for d in /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+                   /usr/local/share/boost /usr/share/swift /usr/local/julia* \
+                   /opt/hostedtoolcache /usr/local/share/powershell \
+                   /usr/local/share/chromium /usr/local/lib/node_modules; do
+            sudo rm -rf "$d" &
+          done
+          wait
+
+          # Pick Docker's data-root: the second disk on /mnt if it has more room.
+          root_free=$(df -BG --output=avail / | tail -1 | tr -dc 0-9)
+          mnt_free=0
+          if mountpoint -q /mnt; then mnt_free=$(df -BG --output=avail /mnt | tail -1 | tr -dc 0-9); fi
+          echo "free after cleanup: / ${root_free}G, /mnt ${mnt_free}G"
+          if [ "$mnt_free" -gt "$root_free" ]; then target=/mnt/docker; else target=/var/lib/docker; fi
+          echo "Docker data-root -> $target"
+
+          # Plain overlay2 store (containerd snapshotter off) so every layer lands
+          # under data-root, once. Merge into the existing daemon.json.
+          sudo systemctl stop docker.socket docker || true
+          if [ "$target" != /var/lib/docker ]; then sudo rm -rf /var/lib/docker; fi
+          sudo mkdir -p "$target"
+          cfg=/etc/docker/daemon.json
+          if sudo test -s "$cfg"; then sudo cat "$cfg" > daemon.json.old; else echo '{}' > daemon.json.old; fi
+          jq --arg r "$target" \
+            '. + {"data-root": $r, "features": ((.features // {}) + {"containerd-snapshotter": false})}' \
+            daemon.json.old > daemon.json.new
+          sudo install -m 644 daemon.json.new "$cfg"
+          cat "$cfg"
+          sudo systemctl start docker
+          docker info --format 'DockerRootDir={{.DockerRootDir}} Driver={{.Driver}} ServerVersion={{.ServerVersion}}'
+
+          echo "================ df -h (AFTER freeing space) ================="
+          df -h
+          echo "=============================================================="
+
+          dr=$(docker info --format '{{.DockerRootDir}}')
+          free=$(df -BG --output=avail "$dr" | tail -1 | tr -dc 0-9)
+          need=35; [ "$FW" = tensorrtllm ] && need=50
+          echo "Free on Docker data-root ($dr): ${free} GB (need >= ${need} GB for $FW)"
+          echo "DATA_ROOT_FREE_GB=$free" >> "$GITHUB_ENV"
+          echo "DATA_ROOT=$dr" >> "$GITHUB_ENV"
+          if [ "$free" -lt "$need" ]; then
+            echo "::error::Only ${free} GB free on $dr; $FW needs >= ${need} GB. Stopping before the pull."
+            exit 1
+          fi
+
+      - name: Resolve base digest (linux/amd64)
+        run: |
+          set -euo pipefail
+          repo="$NVCR_NS/$FW-runtime-nightly"
+          token=$(curl -fsS "https://nvcr.io/proxy_auth?scope=repository:${repo}:pull" | jq -r .token)
+          accept='application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+          curl -fsS -D hdr.txt -o manifest.json -H "Authorization: Bearer $token" -H "Accept: $accept" \
+            "https://nvcr.io/v2/${repo}/manifests/${TAG}"
+          if jq -e '.manifests' manifest.json >/dev/null; then
+            digest=$(jq -r '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64")][0].digest // empty' manifest.json)
+          else
+            digest=$(grep -i '^docker-content-digest:' hdr.txt | awk '{print $2}' | tr -d '\r')
+          fi
+          if [ -z "$digest" ]; then echo "::error::No linux/amd64 manifest for nvcr.io/$repo:$TAG"; exit 1; fi
+          base_name="nvcr.io/$repo:$TAG"
+          {
+            echo "BASE_NAME=$base_name"
+            echo "BASE_DIGEST=$digest"
+            echo "BASE_REF=$base_name@$digest"
+            echo "IMAGE=${GHCR_PREFIX}${FW}-ssh:${TAG}"
+          } >> "$GITHUB_ENV"
+          echo "base: $base_name"
+          echo "amd64 digest: $digest"
+
+      - name: Pull base
+        run: |
+          set -euo pipefail
+          t0=$(date +%s)
+          docker pull --platform linux/amd64 "$BASE_REF"
+          echo "PULL_SECONDS=$(( $(date +%s) - t0 ))" >> "$GITHUB_ENV"
+          df -h "$DATA_ROOT"
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          t0=$(date +%s)
+          # Default docker driver: layers go into the daemon store once; no cache export.
+          docker build --platform linux/amd64 \
+            --build-arg BASE="$BASE_REF" \
+            --build-arg BASE_NAME="$BASE_NAME" \
+            --build-arg BASE_DIGEST="$BASE_DIGEST" \
+            -t "$IMAGE" .
+          echo "BUILD_SECONDS=$(( $(date +%s) - t0 ))" >> "$GITHUB_ENV"
+          df -h "$DATA_ROOT"
+
+      - name: Smoke test
+        run: |
+          set -uo pipefail
+          fails=0
+          ok()  { echo "SMOKE PASS [$FW] $*"; }
+          bad() { echo "SMOKE FAIL [$FW] $*"; fails=$((fails + 1)); }
+
+          # 1. Default user is root (no --user flag on purpose).
+          uid=$(docker run --rm --entrypoint id "$IMAGE" -u 2>&1)
+          [ "$uid" = 0 ] && ok "default user: id -u = $uid" || bad "default user: id -u = $uid"
+
+          # 2. sshd present.
+          docker run --rm --user root --entrypoint test "$IMAGE" -x /usr/sbin/sshd \
+            && ok "test -x /usr/sbin/sshd" || bad "test -x /usr/sbin/sshd"
+
+          # 3. No baked host keys.
+          keys=$(docker run --rm --user root --entrypoint /bin/sh "$IMAGE" -c 'ls /etc/ssh/ssh_host_* 2>/dev/null' || true)
+          [ -z "$keys" ] && ok "no baked host keys (ls /etc/ssh/ssh_host_* empty)" || bad "baked host keys: $keys"
+
+          # 4. Config valid once keys exist, and the hardening is effective.
+          out=$(docker run --rm --user root --entrypoint /bin/sh "$IMAGE" -c \
+            'ssh-keygen -A >/dev/null && /usr/sbin/sshd -t && echo SSHD_T_OK && /usr/sbin/sshd -T 2>/dev/null | grep -Ei "^(passwordauthentication|kbdinteractiveauthentication|permitrootlogin) "' 2>&1)
+          echo "$out"
+          if grep -q SSHD_T_OK <<<"$out" \
+             && grep -qi '^passwordauthentication no' <<<"$out" \
+             && grep -qi '^kbdinteractiveauthentication no' <<<"$out" \
+             && grep -qi '^permitrootlogin without-password\|^permitrootlogin prohibit-password' <<<"$out"; then
+            ok "ssh-keygen -A && sshd -t; effective: password=no kbdinteractive=no root=prohibit-password"
+          else
+            bad "sshd -t or effective hardening"
+          fi
+
+          # 5. Environment preserved vs. the base image.
+          pick='.[0].Config | {PATH: ((.Env // []) | map(select(startswith("PATH="))) | .[0]),
+                               VIRTUAL_ENV: ((.Env // []) | map(select(startswith("VIRTUAL_ENV="))) | .[0]),
+                               Entrypoint, Cmd, WorkingDir}'
+          b=$(docker image inspect "$BASE_REF" | jq -cS "$pick")
+          n=$(docker image inspect "$IMAGE"    | jq -cS "$pick")
+          echo "base : $b"; echo "built: $n"
+          [ "$b" = "$n" ] && ok "PATH/VIRTUAL_ENV/Entrypoint/Cmd/WorkingDir match base" || bad "env/entrypoint differ from base"
+          be=$(docker image inspect "$BASE_REF" | jq -c '.[0].Config.Env | sort')
+          ne=$(docker image inspect "$IMAGE"    | jq -c '.[0].Config.Env | sort')
+          [ "$be" = "$ne" ] && ok "full Config.Env identical to base" || bad "Config.Env differs: base=$be built=$ne"
+
+          # 6. Labels.
+          lbl=$(docker image inspect "$IMAGE" | jq -c '.[0].Config.Labels | with_entries(select(.key | startswith("org.opencontainers.image.")))')
+          echo "labels: $lbl"
+          if [ "$(jq -r '."org.opencontainers.image.base.name"' <<<"$lbl")" = "$BASE_NAME" ] \
+             && [ "$(jq -r '."org.opencontainers.image.base.digest"' <<<"$lbl")" = "$BASE_DIGEST" ] \
+             && [ "$(jq -r '."org.opencontainers.image.source"' <<<"$lbl")" = "https://github.com/swhsiang/dynamo-pod-images" ]; then
+            ok "labels: base.name=$BASE_NAME base.digest=$BASE_DIGEST"
+          else bad "labels wrong"; fi
+
+          # 7. Platform.
+          plat=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE")
+          [ "$plat" = linux/amd64 ] && ok "platform $plat" || bad "platform $plat"
+
+          # 8. Interpreter that imports Dynamo (through the image's own entrypoint).
+          out=$(docker run --rm --user root "$IMAGE" python3 -c 'import dynamo, sys; print("DYNAMO_PY=" + sys.executable)' 2>&1 || true)
+          py=$(grep -o 'DYNAMO_PY=.*' <<<"$out" | head -1 | cut -d= -f2-)
+          how="python3 on PATH"
+          if [ -z "$py" ]; then
+            echo "python3 on PATH cannot import dynamo; output was:"; echo "$out" | tail -5
+            out=$(docker run --rm --user root --entrypoint /bin/bash "$IMAGE" -c '
+              for p in /opt/dynamo/venv/bin/python /opt/sglang/bin/python /opt/vllm/bin/python \
+                       /opt/*/bin/python3 /opt/*/*/bin/python3; do
+                [ -x "$p" ] && "$p" -c "import dynamo" 2>/dev/null && { echo "DYNAMO_PY=$p"; break; }
+              done' 2>&1 || true)
+            py=$(grep -o 'DYNAMO_PY=.*' <<<"$out" | head -1 | cut -d= -f2-)
+            how="search under /opt"
+          fi
+          if [ -n "$py" ]; then
+            ok "dynamo interpreter ($how): $py"
+            echo "DYNAMO_PY=$py" >> "$GITHUB_ENV"
+          else
+            bad "no interpreter can import dynamo"
+          fi
+
+          echo "smoke failures: $fails"
+          [ "$fails" -eq 0 ]
+
+      - name: Push to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          t0=$(date +%s)
+          docker push "$IMAGE"
+          push_s=$(( $(date +%s) - t0 ))
+          digest=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGE" \
+                   | grep "^${GHCR_PREFIX}${FW}-ssh@" | head -1 | cut -d@ -f2)
+          raw=$(docker buildx imagetools inspect --raw "$IMAGE")
+          echo "pushed mediaType: $(jq -r .mediaType <<<"$raw")"
+          bytes=$(jq '([.layers[].size] | add) + .config.size' <<<"$raw")
+          gb=$(awk -v b="$bytes" 'BEGIN { printf "%.2f", b / 1e9 }')
+          docker logout ghcr.io
+
+          # Must not be anonymously pullable (packages stay private).
+          anon=$(curl -s "https://ghcr.io/token?scope=repository:swhsiang/dynamo-${FW}-ssh:pull" | jq -r '.token // empty')
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${anon:-none}" \
+                 -H 'Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json' \
+                 "https://ghcr.io/v2/swhsiang/dynamo-${FW}-ssh/manifests/${TAG}")
+          echo "anonymous manifest GET -> HTTP $code"
+
+          {
+            echo "### $FW"
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| image | \`$IMAGE\` |"
+            echo "| digest | \`$digest\` |"
+            echo "| compressed size | $gb GB ($bytes bytes) |"
+            echo "| base | \`$BASE_NAME\` |"
+            echo "| base amd64 digest | \`$BASE_DIGEST\` |"
+            echo "| dynamo interpreter | \`$DYNAMO_PY\` |"
+            echo "| free on data-root ($DATA_ROOT) | $DATA_ROOT_FREE_GB GB |"
+            echo "| pull / build / push | ${PULL_SECONDS}s / ${BUILD_SECONDS}s / ${push_s}s |"
+            echo "| anonymous pull | HTTP $code |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "RESULT image=$IMAGE digest=$digest compressed_bytes=$bytes pull_s=$PULL_SECONDS build_s=$BUILD_SECONDS push_s=$push_s python=$DYNAMO_PY"
+
+          if [ "$code" = 200 ]; then
+            echo "::error::$IMAGE is anonymously pullable (public). It must be private."
+            exit 1
+          fi
+
+      - name: Disk usage at end
+        if: always()
+        run: df -h; docker system df || true
