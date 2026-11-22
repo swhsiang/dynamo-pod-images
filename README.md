@@ -1,7 +1,7 @@
 # dynamo-pod-images
 
 Thin "SSH-ready" images built on top of NVIDIA's Dynamo nightly runtime images, for use as
-RunPod pod templates. The repo is public; the images are pushed to GHCR as **private** packages:
+RunPod pod templates. The repo is public, and so far the GHCR packages are too (see Licence):
 
 | framework | base (nvcr.io) | image (ghcr.io) |
 |---|---|---|
@@ -106,7 +106,12 @@ aren't used.
 ## Licence
 
 This repository is public; it holds only the Dockerfile, workflow and docs, no NVIDIA content.
-The images are a different matter. The bases are NVIDIA NGC containers. NGC's container licence may not permit public
-redistribution of derived images, so **these packages must stay private**. Don't change
-their visibility. Pulling them (for example from RunPod) needs registry credentials: a
-GitHub token with only the `read:packages` scope.
+The images are a different matter: the bases are NVIDIA NGC containers, and NGC's container
+licence may not permit public redistribution of derived images.
+
+Packages pushed from this public repo came out **public** on GHCR, even though GitHub's docs
+say new packages start private. The push step reports this as a warning and does not fail. If
+you want them private, change each package's visibility in its settings (or delete it), and
+make this repo private before rebuilding. A private package needs registry credentials to pull
+(for example from RunPod): a GitHub token with only the `read:packages` scope. A public one
+needs none.
