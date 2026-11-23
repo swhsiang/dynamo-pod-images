@@ -25,6 +25,11 @@ concurrency:
 env:
   NVCR_NS: nvidia/ai-dynamo
   GHCR_PREFIX: ghcr.io/swhsiang/dynamo-
+  # Revision of this repo's layer. Bump it whenever the Dockerfile changes what
+  # the layer adds, so a rebuild on the same nightly gets a new tag instead of
+  # overwriting one that templates and logs already point at.
+  # r1 (no suffix): sshd only. r2: + pytest / pytest-timeout.
+  LAYER_REV: "2"
 
 jobs:
   resolve:
@@ -202,7 +207,8 @@ jobs:
             echo "BASE_NAME=$base_name"
             echo "BASE_DIGEST=$digest"
             echo "BASE_REF=$base_name@$digest"
-            echo "IMAGE=${GHCR_PREFIX}${FW}-ssh:${TAG}"
+            echo "IMAGE_TAG=${TAG}-r${LAYER_REV}"
+            echo "IMAGE=${GHCR_PREFIX}${FW}-ssh:${TAG}-r${LAYER_REV}"
           } >> "$GITHUB_ENV"
           echo "base: $base_name"
           echo "amd64 digest: $digest"
@@ -306,6 +312,14 @@ jobs:
             bad "no interpreter can import dynamo"
           fi
 
+          # 9. Test tools for the dynamo-hunt pod driver, in the Dynamo interpreter.
+          if [ -n "$py" ]; then
+            out=$(docker run --rm --user root --entrypoint "$py" "$IMAGE" -c \
+              'import pytest, pytest_timeout, importlib.metadata as m; print("PYTEST=" + pytest.__version__ + " timeout=" + m.version("pytest-timeout"))' 2>&1 || true)
+            v=$(grep -o 'PYTEST=.*' <<<"$out" | head -1 | cut -d= -f2-)
+            [ -n "$v" ] && ok "pytest in $py: $v" || { echo "$out" | tail -5; bad "pytest/pytest-timeout not importable by $py"; }
+          fi
+
           echo "smoke failures: $fails"
           [ "$fails" -eq 0 ]
 
@@ -330,7 +344,7 @@ jobs:
           anon=$(curl -s "https://ghcr.io/token?scope=repository:swhsiang/dynamo-${FW}-ssh:pull" | jq -r '.token // empty')
           code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${anon:-none}" \
                  -H 'Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json' \
-                 "https://ghcr.io/v2/swhsiang/dynamo-${FW}-ssh/manifests/${TAG}")
+                 "https://ghcr.io/v2/swhsiang/dynamo-${FW}-ssh/manifests/${IMAGE_TAG}")
           echo "anonymous manifest GET -> HTTP $code"
 
           {
