@@ -45,11 +45,15 @@ RUN apt-get update \
 # missing is installed, so an image that already ships pytest keeps its version.
 # - tensorrtllm: /opt/dynamo/venv has neither pytest nor pytest-timeout.
 # - vllm, sglang: pytest present, pytest-timeout missing (probed 2026-11-22).
+# - all three: pytest-asyncio missing (probed 2026-11-24 on sglang; Dynamo's async tests
+#   need it, its pyproject sets asyncio_mode=auto). 1.3.0 is Dynamo's own pin
+#   (container/deps/requirements.test.txt) and supports pytest 8.2 up to 9.x.
 # The *_BREAK_SYSTEM_PACKAGES variables are set for this RUN only (not ENV, so
 # Config.Env stays identical to the base): vllm's interpreter is /usr/bin/python3,
 # which may carry a PEP 668 EXTERNALLY-MANAGED marker.
 ARG PYTEST_VERSION=8.3.5
 ARG PYTEST_TIMEOUT_VERSION=2.4.0
+ARG PYTEST_ASYNCIO_VERSION=1.3.0
 RUN set -eu; \
     py=""; \
     for p in python3 /opt/dynamo/venv/bin/python /opt/sglang/bin/python /opt/vllm/bin/python \
@@ -62,6 +66,7 @@ RUN set -eu; \
     want=""; \
     "$py" -c "import pytest" 2>/dev/null || want="pytest==${PYTEST_VERSION}"; \
     "$py" -c "import pytest_timeout" 2>/dev/null || want="$want pytest-timeout==${PYTEST_TIMEOUT_VERSION}"; \
+    "$py" -c "import pytest_asyncio" 2>/dev/null || want="$want pytest-asyncio==${PYTEST_ASYNCIO_VERSION}"; \
     echo "dynamo interpreter: $py; installing: ${want:-nothing}"; \
     if [ -n "$want" ]; then \
       if "$py" -m pip --version >/dev/null 2>&1; then \
@@ -73,4 +78,4 @@ RUN set -eu; \
         echo "neither pip nor uv available for $py" >&2; exit 1; \
       fi; \
     fi; \
-    "$py" -c "import pytest, pytest_timeout; print('pytest', pytest.__version__)"
+    "$py" -c "import pytest, pytest_timeout, pytest_asyncio; print('pytest', pytest.__version__)"

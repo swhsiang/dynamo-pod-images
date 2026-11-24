@@ -28,8 +28,8 @@ env:
   # Revision of this repo's layer. Bump it whenever the Dockerfile changes what
   # the layer adds, so a rebuild on the same nightly gets a new tag instead of
   # overwriting one that templates and logs already point at.
-  # r1 (no suffix): sshd only. r2: + pytest / pytest-timeout.
-  LAYER_REV: "2"
+  # r1 (no suffix): sshd only. r2: + pytest / pytest-timeout. r3: + pytest-asyncio.
+  LAYER_REV: "3"
 
 jobs:
   resolve:
@@ -315,9 +315,9 @@ jobs:
           # 9. Test tools for the dynamo-hunt pod driver, in the Dynamo interpreter.
           if [ -n "$py" ]; then
             out=$(docker run --rm --user root --entrypoint "$py" "$IMAGE" -c \
-              'import pytest, pytest_timeout, importlib.metadata as m; print("PYTEST=" + pytest.__version__ + " timeout=" + m.version("pytest-timeout"))' 2>&1 || true)
+              'import pytest, pytest_timeout, pytest_asyncio, importlib.metadata as m; print("PYTEST=" + pytest.__version__ + " timeout=" + m.version("pytest-timeout") + " asyncio=" + m.version("pytest-asyncio"))' 2>&1 || true)
             v=$(grep -o 'PYTEST=.*' <<<"$out" | head -1 | cut -d= -f2-)
-            [ -n "$v" ] && ok "pytest in $py: $v" || { echo "$out" | tail -5; bad "pytest/pytest-timeout not importable by $py"; }
+            [ -n "$v" ] && ok "pytest in $py: $v" || { echo "$out" | tail -5; bad "pytest/pytest-timeout/pytest-asyncio not importable by $py"; }
           fi
 
           echo "smoke failures: $fails"

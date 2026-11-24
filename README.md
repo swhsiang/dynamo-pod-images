@@ -12,7 +12,7 @@ RunPod pod templates. The repo is public, and so far the GHCR packages are too (
 `<tag>` is the base's dated nightly tag (`YYYYMMDD-<shortsha>`). `-r<n>` is this repo's layer
 revision (`LAYER_REV` in the workflow), bumped whenever the Dockerfile changes, so a rebuild on
 the same nightly never overwrites a tag that a template already points at. The first images
-(`20261117-7a70a51`, no suffix) are revision 1: sshd only. Revision 2 adds pytest. There is
+(`20261117-7a70a51`, no suffix) are revision 1: sshd only. Revision 2 adds pytest and pytest-timeout. Revision 3 adds pytest-asyncio. There is
 no `latest` tag.
 
 ## What the layer adds
@@ -23,11 +23,12 @@ The [Dockerfile](Dockerfile) adds only:
 - `openssh-server`, and `/run/sshd`.
 - An sshd drop-in, `/etc/ssh/sshd_config.d/00-dynamo-pod-hardening.conf`: `PasswordAuthentication no`,
   `KbdInteractiveAuthentication no`, `PermitRootLogin prohibit-password`.
-- pytest and pytest-timeout in the interpreter that imports Dynamo, for running tests on a pod
-  (revision 2). Only what's missing is installed (pins: `PYTEST_VERSION`, `PYTEST_TIMEOUT_VERSION`
-  build args), so an image that already ships pytest keeps its version. The tensorrtllm venv had
+- pytest, pytest-timeout and pytest-asyncio in the interpreter that imports Dynamo, for running
+  tests on a pod (revision 2: pytest, pytest-timeout; revision 3: pytest-asyncio, which Dynamo's
+  async tests need). Only what's missing is installed (pins: `PYTEST_VERSION`,
+  `PYTEST_TIMEOUT_VERSION`, `PYTEST_ASYNCIO_VERSION` build args), so an image that already ships pytest keeps its version. The tensorrtllm venv had
   neither; vllm and sglang lacked only pytest-timeout. The build fails if neither pip nor uv can
-  install into that interpreter. Smoke check 9 confirms both import.
+  install into that interpreter. Smoke check 9 confirms all three import.
 - No host keys (the package's keys are deleted; each pod runs `ssh-keygen -A` at start) and no
   `authorized_keys`.
 - OCI labels `org.opencontainers.image.source`, `.base.name` (full base ref) and `.base.digest`
